@@ -629,7 +629,7 @@
 #                  no compression, 1 means the best compression speed, and 9 means best
 #                  compression ratio which will consume more CPU.
 #
-# @compress-with-qat: compress with qat on and off.
+# @compress-with-qat: compress with qat on and off. (Since 8.1)
 #
 # @compress-threads: Set compression thread count to be used in live migration,
 #                    the compression thread count is an integer between 1 and 255.
@@ -801,7 +801,7 @@
 #
 # @compress-level: compression level
 #
-# @compress-with-qat: compression with qat
+# @compress-with-qat: compression with qat (Since 8.1)
 #
 # @compress-threads: compression thread count
 #

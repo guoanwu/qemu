@@ -464,7 +464,13 @@ if have_system or have_tools
                       method: 'pkg-config', kwargs: static_kwargs)
 endif
 zlib = dependency('zlib', required: true, kwargs: static_kwargs)
-qatzip = dependency('qatzip', required: true, method: 'pkg-config', kwargs: static_kwargs)
+
+qatzip = not_found
+if not get_option('qatzip').auto()
+  qatzip = dependency('qatzip', required: get_option('qatzip'),
+                         method: 'pkg-config',
+                         static: enable_static)
+endif
 
 libaio = not_found
 if not get_option('linux_aio').auto() or have_block
@@ -1551,6 +1557,7 @@ config_host_data.set('CONFIG_SDL', sdl.found())
 config_host_data.set('CONFIG_SDL_IMAGE', sdl_image.found())
 config_host_data.set('CONFIG_SECCOMP', seccomp.found())
 config_host_data.set('CONFIG_SNAPPY', snappy.found())
+config_host_data.set('CONFIG_QATZIP', qatzip.found())
 config_host_data.set('CONFIG_TPM', have_tpm)
 config_host_data.set('CONFIG_USB_LIBUSB', libusb.found())
 config_host_data.set('CONFIG_VDE', vde.found())
@@ -3698,6 +3705,7 @@ summary_info += {'vde support':       vde}
 summary_info += {'netmap support':    have_netmap}
 summary_info += {'l2tpv3 support':    have_l2tpv3}
 summary_info += {'Linux AIO support': libaio}
+summary_info += {'qatzip compress support': qatzip}
 summary_info += {'Linux io_uring support': linux_io_uring}
 summary_info += {'ATTR/XATTR support': libattr}
 summary_info += {'RDMA support':      config_host.has_key('CONFIG_RDMA')}

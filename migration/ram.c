@@ -456,12 +456,14 @@ struct CompressParam {
     z_stream stream;
     uint8_t *originbuf;
 
+#ifdef CONFIG_QATZIP
     /*multi page address for compression*/
     MultiPageAddr mpa;
     QzSession_T qzsess;
     uint8_t *decompbuf;
     uint8_t *compbuf;
     /* QzStream_T qzstream; */
+#endif
 };
 typedef struct CompressParam CompressParam;
 
@@ -473,14 +475,16 @@ struct DecompressParam {
     void *des;
     int len;
     z_stream stream;
-
-    /* decompress multi pages with qzlib*/
+    uint8_t *compbuf; /* buffer to be decompressed */
     RAMBlock *block;
+
+#ifdef CONFIG_QATZIP
+    /* decompress multi pages with qzlib*/
     QzSession_T qzsess;
     /* QzStream_T qzstream; */
-    uint8_t *compbuf; /* buffer to be decompressed */
     uint8_t *decompbuf; /* buffer after decompress */
     MultiPageAddr mpa;   /* destination */
+#endif
 };
 typedef struct DecompressParam DecompressParam;
 
@@ -501,6 +505,7 @@ static QemuThread *decompress_threads;
 static QemuMutex decomp_done_lock;
 static QemuCond decomp_done_cond;
 
+#ifdef CONFIG_QATZIP
 static inline uint64_t
 multi_page_addr_get_one(MultiPageAddr *mpa, uint64_t idx);
 static inline void
@@ -539,6 +544,7 @@ do_decompress_ram_page_multiple(QzSession_T *qzsess, uint8_t *compbuf,
 static int
 qemu_get_multiple(QEMUFile *f, MultiPageAddr *mpa,
                 uint8_t *compbuf, int *pbytes);
+#endif
 
 static bool do_compress_ram_page(QEMUFile *f, z_stream *stream,
             RAMBlock *block, ram_addr_t offset, uint8_t *source_buf);
@@ -548,7 +554,6 @@ static void *do_data_compress(void *opaque)
     CompressParam *param = opaque;
     RAMBlock *block;
     ram_addr_t offset;
-    MultiPageAddr *mpa;
     bool zero_page;
 
     qemu_mutex_lock(&param->mutex);
@@ -556,17 +561,20 @@ static void *do_data_compress(void *opaque)
         if (param->block) {
             block = param->block;
             offset = param->offset;
-            mpa = &param->mpa;
             param->block = NULL;
             qemu_mutex_unlock(&param->mutex);
+#ifdef CONFIG_QATZIP
             if (migrate_compress_with_qat()) {
                 do_compress_ram_page_multiple(param->file, &param->qzsess,
-                    param->decompbuf, param->compbuf, block, mpa);
+                    param->decompbuf, param->compbuf, block, &param->mpa);
             } else {
+#endif
                 zero_page = do_compress_ram_page(param->file,
                     &param->stream, block, offset, param->originbuf);
                 param->zero_page = zero_page;
+#ifdef CONFIG_QATZIP
             }
+#endif
 
             qemu_mutex_lock(&comp_done_lock);
             param->done = true;
@@ -609,16 +617,19 @@ static void compress_threads_save_cleanup(void)
         qemu_thread_join(compress_threads + i);
         qemu_mutex_destroy(&comp_param[i].mutex);
         qemu_cond_destroy(&comp_param[i].cond);
-        /* call deflateEnd or qzTeardownSession, qzClose */
+#ifdef CONFIG_QATZIP
         if (migrate_compress_with_qat()) {
             qzTeardownSession(&comp_param[i].qzsess);
             qzClose(&comp_param[i].qzsess);
             qzFree(comp_param[i].compbuf);
             qzFree(comp_param[i].decompbuf);
         } else {
+#endif
             deflateEnd(&comp_param[i].stream);
             g_free(comp_param[i].originbuf);
+#ifdef CONFIG_QATZIP
         }
+#endif
         qemu_fclose(comp_param[i].file);
         comp_param[i].file = NULL;
     }
@@ -633,8 +644,6 @@ static void compress_threads_save_cleanup(void)
 static int compress_threads_save_setup(void)
 {
     int i, thread_count;
-    QzSessionParams_T sessParam;
-    int ret;
 
     if (!migrate_use_compression()) {
         return 0;
@@ -645,7 +654,9 @@ static int compress_threads_save_setup(void)
     qemu_cond_init(&comp_done_cond);
     qemu_mutex_init(&comp_done_lock);
     for (i = 0; i < thread_count; i++) {
+#ifdef CONFIG_QATZIP
         if (!migrate_compress_with_qat()) {
+#endif
             comp_param[i].originbuf = g_try_malloc(TARGET_PAGE_SIZE);
             if (!comp_param[i].originbuf) {
                 goto exit;
@@ -656,7 +667,10 @@ static int compress_threads_save_setup(void)
                 g_free(comp_param[i].originbuf);
                 goto exit;
             }
+#ifdef CONFIG_QATZIP
         } else {
+            int ret;
+            QzSessionParams_T sessParam;
             ret = qzInit(&comp_param[i].qzsess, 1);
             if (ret != QZ_OK && ret != QZ_DUPLICATE) {
                 error_report("qzInit on comp thread %d failed %d!", i, ret);
@@ -681,7 +695,7 @@ static int compress_threads_save_setup(void)
                 goto exit;
             }
         }
-
+#endif
         /* comp_param[i].file is just used as a dummy buffer to save data,
          * set its ops to empty.
          */
@@ -1572,13 +1586,17 @@ retry:
             comp_param[idx].done = false;
             bytes_xmit = qemu_put_qemu_file(rs->f, comp_param[idx].file);
             qemu_mutex_lock(&comp_param[idx].mutex);
+#ifdef CONFIG_QATZIP
             if (migrate_compress_with_qat()) {
                 set_compress_params_multiple(&comp_param[idx], block, mpa);
                 pages = mpa->pages;
             } else {
+#endif
                 set_compress_params(&comp_param[idx], block, offset);
                 pages = 1;
+#ifdef CONFIG_QATZIP
             }
+#endif
             qemu_cond_signal(&comp_param[idx].cond);
             qemu_mutex_unlock(&comp_param[idx].mutex);
             update_compress_thread_counts(&comp_param[idx], bytes_xmit);
@@ -1611,12 +1629,21 @@ retry:
  */
 static bool find_dirty_block(RAMState *rs, PageSearchStatus *pss, bool *again)
 {
-    if (!pss->first_page_in_block && migrate_compress_with_qat()) {
-        pss->page = migration_bitmap_find_dirty_multiple(rs, pss->block,
+#ifdef CONFIG_QATZIP
+    if (migrate_compress_with_qat()) {
+        if (!pss->first_page_in_block) {
+            pss->page = migration_bitmap_find_dirty_multiple(rs, pss->block,
                                                     pss->page, &pss->mpa);
+        } else {
+            pss->page = migration_bitmap_find_dirty(rs, pss->block, pss->page);
+        }
     } else {
+#endif
         pss->page = migration_bitmap_find_dirty(rs, pss->block, pss->page);
+#ifdef CONFIG_QATZIP
     }
+#endif
+
     if (pss->complete_round && pss->block == rs->last_seen_block &&
         pss->page >= rs->last_page) {
         /*
@@ -2364,11 +2391,19 @@ static int ram_save_host_page_single(RAMState *rs, PageSearchStatus *pss)
  */
 static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
 {
-    if (!pss->first_page_in_block && migrate_compress_with_qat()) {
-        return ram_save_host_page_multiple(rs, pss);
+#ifdef CONFIG_QATZIP
+    if (migrate_compress_with_qat()) {
+        if (!pss->first_page_in_block) {
+            return ram_save_host_page_multiple(rs, pss);
+        } else {
+            return ram_save_host_page_single(rs, pss);
+        }
     } else {
+#endif
         return ram_save_host_page_single(rs, pss);
+#ifdef CONFIG_QATZIP
     }
+#endif
 }
 
 /**
@@ -3465,22 +3500,20 @@ static void *do_data_decompress(void *opaque)
     uint64_t pagesize;
     uint8_t *des;
     int len, ret;
-    RAMBlock *block;
 
     qemu_mutex_lock(&param->mutex);
     while (!param->quit) {
         if (param->block) {
-            block = param->block;
             des = param->des;
             len = param->len;
-            param->block = NULL;
             qemu_mutex_unlock(&param->mutex);
-
+#ifdef CONFIG_QATZIP
             if (migrate_compress_with_qat()) {
                 do_decompress_ram_page_multiple(&param->qzsess,
                     param->compbuf, param->decompbuf,
-                    block, len, &param->mpa);
+                    param->block, len, &param->mpa);
             } else {
+#endif
                 pagesize = TARGET_PAGE_SIZE;
                 ret = qemu_uncompress_data(&param->stream, des, pagesize,
                                         param->compbuf, len);
@@ -3488,13 +3521,14 @@ static void *do_data_decompress(void *opaque)
                     error_report("decompress data failed");
                     qemu_file_set_error(decomp_file, ret);
                 }
+#ifdef CONFIG_QATZIP
             }
-
+#endif
+            param->block = NULL;
             qemu_mutex_lock(&decomp_done_lock);
             param->done = true;
             qemu_cond_signal(&decomp_done_cond);
             qemu_mutex_unlock(&decomp_done_lock);
-
             qemu_mutex_lock(&param->mutex);
         } else {
             qemu_cond_wait(&param->cond, &param->mutex);
@@ -3554,17 +3588,20 @@ static void compress_threads_load_cleanup(void)
         qemu_thread_join(decompress_threads + i);
         qemu_mutex_destroy(&decomp_param[i].mutex);
         qemu_cond_destroy(&decomp_param[i].cond);
-        /* use the qatzip or zlib inflateEnd here */
+#ifdef CONFIG_QATZIP
         if (migrate_compress_with_qat()) {
             qzTeardownSession(&decomp_param[i].qzsess);
             qzClose(&decomp_param[i].qzsess);
             qzFree(decomp_param[i].compbuf);
             qzFree(decomp_param[i].decompbuf);
         } else {
+#endif
             inflateEnd(&decomp_param[i].stream);
             g_free(decomp_param[i].compbuf);
             decomp_param[i].compbuf = NULL;
+#ifdef CONFIG_QATZIP
         }
+#endif
     }
     g_free(decompress_threads);
     g_free(decomp_param);
@@ -3576,8 +3613,7 @@ static void compress_threads_load_cleanup(void)
 static int compress_threads_load_setup(QEMUFile *f)
 {
     int i, thread_count;
-    QzSessionParams_T sessParam;
-    int ret;
+
 
     if (!migrate_use_compression()) {
         return 0;
@@ -3590,13 +3626,18 @@ static int compress_threads_load_setup(QEMUFile *f)
     qemu_cond_init(&decomp_done_cond);
     decomp_file = f;
     for (i = 0; i < thread_count; i++) {
+#ifdef CONFIG_QATZIP
         if (!migrate_compress_with_qat()) {
+#endif
             if (inflateInit(&decomp_param[i].stream) != Z_OK) {
                 goto exit;
             }
             decomp_param[i].compbuf =
                     g_malloc0(compressBound(TARGET_PAGE_SIZE));
+#ifdef CONFIG_QATZIP
         } else {
+            int ret;
+            QzSessionParams_T sessParam;
             /* call inflateInit or qzInit */
             ret = qzInit(&decomp_param[i].qzsess, 1);
             if (ret != QZ_OK && ret != QZ_DUPLICATE) {
@@ -3622,6 +3663,7 @@ static int compress_threads_load_setup(QEMUFile *f)
                 goto exit;
             }
         }
+#endif
 
         qemu_mutex_init(&decomp_param[i].mutex);
         qemu_cond_init(&decomp_param[i].cond);
@@ -3648,6 +3690,7 @@ static void decompress_data_with_multi_threads(QEMUFile *f, RAMBlock *block,
             if (decomp_param[idx].done) {
                 decomp_param[idx].done = false;
                 qemu_mutex_lock(&decomp_param[idx].mutex);
+#ifdef CONFIG_QATZIP
                 if (migrate_compress_with_qat()) {
                     qemu_get_multiple(f,
                         &decomp_param[idx].mpa,
@@ -3655,11 +3698,14 @@ static void decompress_data_with_multi_threads(QEMUFile *f, RAMBlock *block,
                         &decomp_param[idx].len);
                     decomp_param[idx].block = block;
                 } else {
+#endif
                     qemu_get_buffer(f, decomp_param[idx].compbuf, len);
                     decomp_param[idx].des = host;
                     decomp_param[idx].len = len;
                     decomp_param[idx].block = block;
+#ifdef CONFIG_QATZIP
                 }
+#endif
                 qemu_cond_signal(&decomp_param[idx].cond);
                 qemu_mutex_unlock(&decomp_param[idx].mutex);
                 break;
@@ -4546,6 +4592,7 @@ void ram_mig_init(void)
     ram_block_notifier_add(&ram_mig_ram_notifier);
 }
 
+#ifdef CONFIG_QATZIP
 static inline uint64_t
 multi_page_addr_get_one(MultiPageAddr *mpa, uint64_t idx)
 {
@@ -4845,3 +4892,4 @@ qemu_get_multiple(QEMUFile *f, MultiPageAddr *mpa,
     *pbytes = bytes;
     return 0;
 }
+#endif

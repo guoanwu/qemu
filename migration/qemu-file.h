@@ -25,7 +25,9 @@
 #ifndef MIGRATION_QEMU_FILE_H
 #define MIGRATION_QEMU_FILE_H
 
+#ifdef CONFIG_QATZIP
 #include <qatzip.h>
+#endif
 #include <zlib.h>
 #include "exec/cpu-common.h"
 #include "io/channel.h"
