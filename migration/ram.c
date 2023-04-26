@@ -26,6 +26,7 @@
  * THE SOFTWARE.
  */
 
+#include "qemu/compiler.h"
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
 #include "qemu/bitops.h"
@@ -58,6 +59,7 @@
 #include "sysemu/runstate.h"
 
 #include "hw/boards.h" /* for machine_dump_guest_core() */
+#include <stdint.h>
 
 #if defined(__linux__)
 #include "qemu/userfaultfd.h"
@@ -83,6 +85,8 @@
 #define RAM_SAVE_FLAG_COMPRESS_PAGE    0x100
 
 XBZRLECacheStats xbzrle_counters;
+
+
 
 /* struct contains XBZRLE cache and a static page
    used by the compression */
@@ -409,7 +413,7 @@ static void ram_transferred_add(uint64_t bytes)
 /* define the max page number to compress together */
 #define MULTI_PAGE_NUM 64
 #define COMP_BUF_SIZE (TARGET_PAGE_SIZE *  MULTI_PAGE_NUM * 2)
-#define DECOMP_BUF_SIZE (TARGET_PAGE_SIZE *  MULTI_PAGE_NUM)
+#define DECOMP_BUF_SIZE (TARGET_PAGE_SIZE * MULTI_PAGE_NUM)
 
 typedef struct MultiPageAddr {
     /* real pages that will compress together */
@@ -419,6 +423,7 @@ typedef struct MultiPageAddr {
     /* each address might contain contineous pages*/
     uint64_t addr[MULTI_PAGE_NUM];
 } MultiPageAddr;
+
 
 /* used by the search for pages to send */
 struct PageSearchStatus {
@@ -440,6 +445,52 @@ struct PageSearchStatus {
     bool         complete_round;
 };
 typedef struct PageSearchStatus PageSearchStatus;
+
+
+#if defined(CONFIG_QATZIP)
+static uint64_t
+migration_bitmap_find_dirty_multiple_normal(RAMState *rs,
+                                            RAMBlock *rb,
+                                            uint64_t start,
+                                            MultiPageAddr *mpa);
+static uint64_t
+(*migration_bitmap_find_dirty_multiple)(RAMState *rs,
+                                        RAMBlock *rb,
+                                        uint64_t start,
+                                        MultiPageAddr *mpa)
+= migration_bitmap_find_dirty_multiple_normal;
+#endif
+#if defined(CONFIG_AVX512F_OPT) && defined(CONFIG_AVX512BW_OPT)       \
+    && defined(CONFIG_BMI2_OPT) && defined(CONFIG_QATZIP)
+/*
+ * use flag is more better than funcion pointer for
+ * compiler trigger inline optimization
+ *
+ */
+static uint64_t
+migration_bitmap_find_dirty_multiple_avx512(RAMState *rs,
+                                            RAMBlock *rb,
+                                            uint64_t start,
+                                            MultiPageAddr *mpa);
+
+static void __attribute__((constructor)) init_bitmap_scan_flag(void)
+{
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("bmi2") &&
+       __builtin_cpu_supports("avx512f") &&
+       __builtin_cpu_supports("avx512bw"))
+    {
+        init_avx512_consts_for_bitmap_scan();
+        migration_bitmap_find_dirty_multiple
+            = migration_bitmap_find_dirty_multiple_avx512;
+        return ;
+    }
+    return;
+}
+
+#endif
+
+
 
 CompressionStats compression_counters;
 
@@ -512,11 +563,6 @@ static inline void
 multi_page_addr_put_one(MultiPageAddr *mpa,
                                            uint64_t offset,
                                            uint64_t pages);
-static uint64_t
-migration_bitmap_find_dirty_multiple(RAMState *rs,
-                                     RAMBlock *rb,
-                                     uint64_t start,
-                                     MultiPageAddr *mpa);
 static bool
 migration_bitmap_clear_dirty_multiple(RAMState *rs,
                                     RAMBlock *rb,
@@ -1517,7 +1563,8 @@ static bool do_compress_ram_page(QEMUFile *f, z_stream *stream,
 }
 
 static void
-update_compress_thread_counts(const CompressParam *param, int bytes_xmit)
+update_compress_thread_counts(const CompressParam *param, int bytes_xmit,
+                              int multi_pages)
 {
     ram_transferred_add(bytes_xmit);
 
@@ -1528,7 +1575,9 @@ update_compress_thread_counts(const CompressParam *param, int bytes_xmit)
 
     /* 8 means a header with RAM_SAVE_FLAG_CONTINUE. */
     compression_counters.compressed_size += bytes_xmit - 8;
-    compression_counters.pages++;
+    compression_counters.pages += multi_pages;
+
+
 }
 
 static bool save_page_use_compression(RAMState *rs);
@@ -1559,7 +1608,14 @@ static void flush_compressed_data(RAMState *rs)
              * as there is no further request submitted to the thread,
              * i.e, the thread should be waiting for a request at this point.
              */
-            update_compress_thread_counts(&comp_param[idx], len);
+#ifdef CONFIG_QATZIP
+            (migrate_compress_with_qat()) ?
+                update_compress_thread_counts(&comp_param[idx], len,
+                                              comp_param[idx].mpa.pages)
+                : update_compress_thread_counts(&comp_param[idx], len, 1);
+#else
+            update_compress_thread_counts(&comp_param[idx], len, 1);
+#endif
         }
         qemu_mutex_unlock(&comp_param[idx].mutex);
     }
@@ -1585,9 +1641,14 @@ retry:
         if (comp_param[idx].done) {
             comp_param[idx].done = false;
             bytes_xmit = qemu_put_qemu_file(rs->f, comp_param[idx].file);
+            int multi_pages = 1;
+            #ifdef CONFIG_QATZIP
+            bool qat_enable = migrate_compress_with_qat();
+            multi_pages = (qat_enable ? comp_param[idx].mpa.pages : 1);
+            #endif
             qemu_mutex_lock(&comp_param[idx].mutex);
 #ifdef CONFIG_QATZIP
-            if (migrate_compress_with_qat()) {
+            if (qat_enable) {
                 set_compress_params_multiple(&comp_param[idx], block, mpa);
                 pages = mpa->pages;
             } else {
@@ -1599,7 +1660,8 @@ retry:
 #endif
             qemu_cond_signal(&comp_param[idx].cond);
             qemu_mutex_unlock(&comp_param[idx].mutex);
-            update_compress_thread_counts(&comp_param[idx], bytes_xmit);
+            update_compress_thread_counts(&comp_param[idx],
+                        bytes_xmit, multi_pages);
             break;
         }
     }
@@ -2922,8 +2984,16 @@ static void ram_list_init_bitmaps(void)
              * dirty_memory[DIRTY_MEMORY_MIGRATION] don't include the whole
              * guest memory.
              */
+#if defined(CONFIG_AVX512F_OPT) && defined(CONFIG_AVX512BW_OPT)       \
+&& defined(CONFIG_BMI2_OPT) && defined(CONFIG_QATZIP)
+            /*prevent avx512 scan out of range*/
+            uint64_t bits = (pages & 63) ? (((pages >> 6) + 1) << 6) : pages;
+            block->bmap = bitmap_new(bits);
+            bitmap_set(block->bmap, 0, bits);
+#else
             block->bmap = bitmap_new(pages);
             bitmap_set(block->bmap, 0, pages);
+#endif
             block->clear_bmap_shift = shift;
             block->clear_bmap = bitmap_new(clear_bmap_size(pages, shift));
         }
@@ -3764,9 +3834,16 @@ int colo_init_ram_cache(void)
     if (ram_bytes_total()) {
         RAMBlock *block;
 
-        RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+        RAMBLOCK_FOREACH_NOT_IGNORED(block)
+        {
             uint64_t pages = block->max_length >> TARGET_PAGE_BITS;
+#if defined(CONFIG_AVX512F_OPT) && defined(CONFIG_AVX512BW_OPT)       \
+&& defined(CONFIG_BMI2_OPT) && defined(CONFIG_QATZIP)
+            uint64_t bits = (pages & 64) ? (((pages >> 6) + 1) << 6) : (pages);
+            block->bmap = bitmap_new(bits);
+#else
             block->bmap = bitmap_new(pages);
+#endif
         }
     }
 
@@ -3783,11 +3860,21 @@ void colo_incoming_start_dirty_log(void)
     qemu_mutex_lock_ramlist();
 
     memory_global_dirty_log_sync();
-    WITH_RCU_READ_LOCK_GUARD() {
-        RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+    WITH_RCU_READ_LOCK_GUARD()
+    {
+        RAMBLOCK_FOREACH_NOT_IGNORED(block)
+        {
             ramblock_sync_dirty_bitmap(ram_state, block);
             /* Discard this dirty bitmap record */
+#if defined(CONFIG_AVX512F_OPT) && defined(CONFIG_AVX512BW_OPT)       \
+    && defined(CONFIG_BMI2_OPT) && defined(CONFIG_QATZIP)
+
+            uint64_t pages = block->max_length >> TARGET_PAGE_BITS;
+            uint64_t bits = (pages & 64) ? (((pages >> 6) + 1) << 6) : (pages);
+            bitmap_zero(block->bmap, bits);
+#else
             bitmap_zero(block->bmap, block->max_length >> TARGET_PAGE_BITS);
+#endif
         }
         memory_global_dirty_log_start(GLOBAL_DIRTY_MIGRATION);
     }
@@ -4614,7 +4701,7 @@ static inline void multi_page_addr_put_one(MultiPageAddr *mpa,
 
 /* find the dirty pages and put into the mpa */
 static uint64_t
-migration_bitmap_find_dirty_multiple(RAMState *rs,
+migration_bitmap_find_dirty_multiple_normal(RAMState *rs,
                                      RAMBlock *rb,
                                      uint64_t start,
                                      MultiPageAddr *mpa)
@@ -4632,7 +4719,6 @@ migration_bitmap_find_dirty_multiple(RAMState *rs,
     if (start >= size) {
         return size;
     }
-
     /* from the start pos to search the dirty bitmap*/
     while ((mpa->pages < MULTI_PAGE_NUM)) {
         start = find_next_bit(bitmap, size, start);
@@ -4662,6 +4748,114 @@ migration_bitmap_find_dirty_multiple(RAMState *rs,
     return start;
 }
 
+#if defined(CONFIG_AVX512F_OPT) && defined(CONFIG_AVX512BW_OPT) &&             \
+    defined(CONFIG_BMI2_OPT) && defined(CONFIG_QATZIP)
+
+static inline __attribute__((always_inline)) void
+multi_page_addr_fill_offsets(MultiPageAddr *mpa,
+                             uint64_t base,
+                             uint8_t *offsets,
+                             int64_t offsetsize)
+{
+    uint64_t index = mpa->last_idx;
+    uint64_t remain = (offsetsize & 3);
+    uint64_t count = (offsetsize >> 2);
+    int64_t i = 0;
+    for (int64_t ct = 0; ct < count; ++ct, index += 4, i += 4) {
+        /*unroll loop*/
+        mpa->addr[index]   = ((base + offsets[i]) \
+                        << TARGET_PAGE_BITS) | 1;
+        mpa->addr[index + 1] = ((base + offsets[i + 1]) \
+                        << TARGET_PAGE_BITS) | 1;
+        mpa->addr[index + 2] = ((base + offsets[i + 2]) \
+                        << TARGET_PAGE_BITS) | 1;
+        mpa->addr[index + 3] = ((base + offsets[i + 3]) \
+                        << TARGET_PAGE_BITS) | 1;
+    }
+
+    while (remain--) {
+        mpa->addr[index++] = ((base + offsets[i++]) \
+                        << TARGET_PAGE_BITS) | 1;
+    }
+    mpa->last_idx += offsetsize;
+    mpa->pages += offsetsize;
+}
+
+static inline __attribute__((always_inline)) uint64_t
+get_size_for_last_offset(const uint8_t *offsets,
+                      uint64_t offsetsize,
+                      uint64_t base,
+                      uint64_t pages)
+{
+    uint64_t index = offsetsize - 1;
+    while (base + offsets[index] >= pages) {
+        --index;
+    }
+    return index + 1;
+}
+
+static uint64_t
+migration_bitmap_find_dirty_multiple_avx512(RAMState *rs,
+                                            RAMBlock *rb,
+                                            uint64_t start,
+                                            MultiPageAddr *mpa)
+{
+    uint64_t *bitmap = rb->bmap;
+    uint64_t size = rb->used_length >> TARGET_PAGE_BITS;
+    static uint8_t offsets[64];
+    mpa->last_idx = 0;
+    mpa->pages = 0;
+    if (ramblock_is_ignored(rb)) {
+        return size;
+    }
+    if (start >= size) {
+        return size;
+    }
+    /*
+     * bitmap64 word that belong to start already scaned in previous
+     * round. we need start from next bitmap64 word,if start!=0.
+     * one bitmap word contain 64 dirty page offsets.
+     */
+    uint64_t current_bitmap_word_offset = (start >> 6) + (!(start == 0));
+    uint64_t last_bitmap_word_offset    = (size >> 6);
+    int64_t sz = 0;
+    while (current_bitmap_word_offset <= last_bitmap_word_offset) {
+        sz =
+            find_all_bits_in_bitmap64_avx512(bitmap,
+                    current_bitmap_word_offset, offsets);
+        if (!sz) {
+            ++current_bitmap_word_offset;
+            continue;
+        }
+        uint64_t base = (current_bitmap_word_offset << 6);
+        if (unlikely(current_bitmap_word_offset == last_bitmap_word_offset)) {
+            /*last page may only in the middle of bitmap64 word*/
+            sz = get_size_for_last_offset(offsets, sz, base, size);
+        }
+        /*
+         * let remains offset rescan in next round to avoid
+         * complicated calculate next start index
+         */
+
+        if (mpa->pages + sz > MULTI_PAGE_NUM) {
+            break;
+        }
+
+        multi_page_addr_fill_offsets(mpa, base, offsets, sz);
+        start = base + offsets[sz - 1];
+        ++current_bitmap_word_offset;
+    }
+    /*
+     * if no bit set in last bitmap64 word,
+     * we should set page to the end of bitmap
+     * prevent endless loop
+     */
+    if (unlikely(!sz)) {
+        return size;
+    }
+    return start;
+}
+#endif
 static bool
 migration_bitmap_clear_dirty_multiple(RAMState *rs,
                                     RAMBlock *rb,
@@ -4833,9 +5027,6 @@ do_compress_ram_page_multiple(QEMUFile *f, QzSession_T *qzsess,
     /* memory copy to the IO buffer */
     qemu_put_buffer(f, compbuf, dest_size);
 
-    ram_counters.transferred += dest_size;
-    compression_counters.compressed_size += dest_size;
-    compression_counters.pages += mpa->pages;
     return true;
 }
 

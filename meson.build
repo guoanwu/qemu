@@ -466,10 +466,10 @@ endif
 zlib = dependency('zlib', required: true, kwargs: static_kwargs)
 
 qatzip = not_found
-if not get_option('qatzip').auto()
+if not get_option('qatzip').auto() or have_block
   qatzip = dependency('qatzip', required: get_option('qatzip'),
                          method: 'pkg-config',
-                         static: enable_static)
+                         kwargs: static_kwargs)
 endif
 
 libaio = not_found
@@ -1964,6 +1964,36 @@ config_host_data.set('CONFIG_AVX512F_OPT', get_option('avx512f') \
     }
     int main(int argc, char *argv[]) { return bar(argv[0]); }
   '''), error_message: 'AVX512F not available').allowed())
+
+config_host_data.set('CONFIG_AVX512BW_OPT', get_option('avx512bw') \
+  .require(have_cpuid_h, error_message: 'cpuid.h not available, cannot enable AVX512BW') \
+  .require(cc.links('''
+    #pragma GCC push_options
+    #pragma GCC target("avx512bw")
+    #include <cpuid.h>
+    #include <immintrin.h>
+    static int bar(void *a) {
+       __m512i src,x,y;
+       __mmask64 k;
+       __m512i res=_mm512_mask_add_epi8 (src,k,x,y);
+       return 0;
+    }
+    int main(int argc, char *argv[]) { return bar(argv[0]); }
+  '''), error_message: 'AVX512BW not available').allowed())
+
+config_host_data.set('CONFIG_BMI2_OPT', get_option('bmi2') \
+  .require(have_cpuid_h, error_message: 'cpuid.h not available, cannot enable BMI2') \
+  .require(cc.links('''
+    #pragma GCC push_options
+    #pragma GCC target("bmi2")
+    #include <cpuid.h>
+    #include <immintrin.h>
+    static int bar(void *a) {
+        _pext_u64(123,456);
+       return 0;
+    }
+    int main(int argc, char *argv[]) { return bar(argv[0]); }
+  '''), error_message: 'BMI2 not available').allowed())
 
 if get_option('membarrier').disabled()
   have_membarrier = false
@@ -3563,6 +3593,8 @@ summary_info += {'mutex debugging':   get_option('debug_mutex')}
 summary_info += {'memory allocator':  get_option('malloc')}
 summary_info += {'avx2 optimization': config_host_data.get('CONFIG_AVX2_OPT')}
 summary_info += {'avx512f optimization': config_host_data.get('CONFIG_AVX512F_OPT')}
+summary_info += {'avx512bw optimization': config_host_data.get('CONFIG_AVX512BW_OPT')}
+summary_info += {'bmi2 optimization': config_host_data.get('CONFIG_BMI2_OPT')}
 summary_info += {'gprof enabled':     get_option('gprof')}
 summary_info += {'gcov':              get_option('b_coverage')}
 summary_info += {'thread sanitizer':  config_host.has_key('CONFIG_TSAN')}

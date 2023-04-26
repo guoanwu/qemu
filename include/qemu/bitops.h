@@ -173,6 +173,30 @@ unsigned long find_next_zero_bit(const unsigned long *addr,
                                  unsigned long size,
                                  unsigned long offset);
 
+
+#if defined(CONFIG_AVX512F_OPT) && defined(CONFIG_AVX512BW_OPT) &&             \
+    defined(CONFIG_BMI2_OPT)
+/**
+ * init_avx512_consts_for_bitmap_scan
+ * init global variables for avx512 bitmap scan
+ *
+ */
+void init_avx512_consts_for_bitmap_scan(void);
+
+/**
+ * find_all_bits_in_bitmap64_avx512
+ * find all set bit offsets in single bitmap64 word
+ * @bitmap: The addre to base of bitmap64 words array
+ * @offset: The bimap64 word index in bitmap64 words array
+ * @res: All offset of set bits in this bitmap64 word
+ *
+ * Returns the number of set bit in this bitmap64 word
+ */
+int64_t find_all_bits_in_bitmap64_avx512(const uint64_t *bitmap,
+                    size_t offset,
+                    uint8_t *res);
+#endif
+
 /**
  * find_first_bit - find the first set bit in a memory region
  * @addr: The address to start the search at
@@ -181,6 +205,7 @@ unsigned long find_next_zero_bit(const unsigned long *addr,
  * Returns the bit number of the first set bit,
  * or @size if there is no set bit in the bitmap.
  */
+
 static inline unsigned long find_first_bit(const unsigned long *addr,
                                            unsigned long size)
 {

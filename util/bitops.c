@@ -13,6 +13,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
+#include <stddef.h>
+#include <stdint.h>
 
 /*
  * Find the next set bit in a memory region.
@@ -155,3 +157,67 @@ unsigned long find_last_bit(const unsigned long *addr, unsigned long size)
     /* Not found */
     return size;
 }
+
+#if defined(CONFIG_AVX512F_OPT) && defined(CONFIG_AVX512BW_OPT) \
+    && defined(CONFIG_BMI2_OPT)
+#pragma GCC push_options
+#pragma GCC target("avx512f", "avx512bw", "bmi2")
+#include <immintrin.h>
+
+enum ID_FOR_HALF { half32, half16, half8, half4, half2, half1 };
+
+static const uint64_t HalfVals[] = {
+  0xffffffff00000000,
+  0xffff0000ffff0000,
+  0xff00ff00ff00ff00,
+  0xf0f0f0f0f0f0f0f0,
+  0xcccccccccccccccc,
+  0xaaaaaaaaaaaaaaaa
+};
+static __m512i weightFor0thBits;
+static __m512i weightFor1thBits;
+static __m512i weightFor2thBits;
+static __m512i weightFor3thBits;
+static __m512i weightFor4thBits;
+static __m512i weightFor5thBits;
+static __m512i allZero512;
+
+void init_avx512_consts_for_bitmap_scan(void)
+{
+    weightFor0thBits = _mm512_set1_epi8(1);
+    weightFor1thBits = _mm512_set1_epi8(2);
+    weightFor2thBits = _mm512_set1_epi8(4);
+    weightFor3thBits = _mm512_set1_epi8(8);
+    weightFor4thBits = _mm512_set1_epi8(16);
+    weightFor5thBits = _mm512_set1_epi8(32);
+    allZero512       = _mm512_set1_epi8(0);
+}
+
+inline __attribute__((always_inline))
+int64_t find_all_bits_in_bitmap64_avx512(const uint64_t *bitmap, size_t offset,
+                                               uint8_t *res) {
+  uint64_t bmp64 = bitmap[offset];
+
+  uint64_t bits5sForAllIndexs = _pext_u64(HalfVals[half32], bmp64);
+  uint64_t bits4sForAllIndexs = _pext_u64(HalfVals[half16], bmp64);
+  uint64_t bits3sForAllIndexs = _pext_u64(HalfVals[half8], bmp64);
+  uint64_t bit2sForAllIndexs  = _pext_u64(HalfVals[half4], bmp64);
+  uint64_t bit1sForAllIndexs  = _pext_u64(HalfVals[half2], bmp64);
+  uint64_t bit0sForAllIndexs  = _pext_u64(HalfVals[half1], bmp64);
+
+  __m512i tmp;
+
+  tmp = _mm512_maskz_add_epi8(bits5sForAllIndexs, weightFor5thBits, allZero512);
+  tmp = _mm512_mask_add_epi8(tmp, bits4sForAllIndexs, weightFor4thBits, tmp);
+  tmp = _mm512_mask_add_epi8(tmp, bits3sForAllIndexs, weightFor3thBits, tmp);
+  tmp = _mm512_mask_add_epi8(tmp, bit2sForAllIndexs, weightFor2thBits, tmp);
+  tmp = _mm512_mask_add_epi8(tmp, bit1sForAllIndexs, weightFor1thBits, tmp);
+  tmp = _mm512_mask_add_epi8(tmp, bit0sForAllIndexs, weightFor0thBits, tmp);
+  _mm512_mask_storeu_epi8(res, 0xffffffffffffffff, tmp);
+
+  return __builtin_popcountll(bmp64);
+}
+#pragma GCC pop_options
+#endif
+
+

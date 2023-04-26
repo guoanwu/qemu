@@ -88,8 +88,12 @@ option('membarrier', type: 'feature', value: 'disabled',
 
 option('avx2', type: 'feature', value: 'auto',
        description: 'AVX2 optimizations')
-option('avx512f', type: 'feature', value: 'disabled',
+option('avx512f', type: 'feature', value: 'auto',
        description: 'AVX512F optimizations')
+option('avx512bw', type: 'feature', value: 'auto',
+       description: 'AVX512F optimizations')
+option('bmi2', type: 'feature', value: 'auto',
+       description: 'BMI2 optimizations')
 
 option('attr', type : 'feature', value : 'auto',
        description: 'attr/xattr support')
