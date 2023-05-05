@@ -186,5 +186,13 @@ size_t ram_control_save_page(QEMUFile *f, ram_addr_t block_offset,
                              ram_addr_t offset, size_t size,
                              uint64_t *bytes_sent);
 QIOChannel *qemu_file_get_ioc(QEMUFile *file);
+#if defined(CONFIG_QATZIP)
+ssize_t qemu_put_compression_data_qat(QEMUFile *f,
+                                      QzSession_T *qzsess,
+                                      uint8_t *origin_buf,
+                                      uint32_t origins_sz,
+                                      uint8_t *compress_buf,
+                                      uint32_t compress_buf_sz);
+#endif
 
 #endif

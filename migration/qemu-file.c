@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "qemu/osdep.h"
 #include "qemu/madvise.h"
 #include "qemu/error-report.h"
@@ -30,8 +31,9 @@
 #include "trace.h"
 #include "qapi/error.h"
 
+
 /* with qat hw, the io buffer size need to expand */
-#define IO_BUF_SIZE 524288
+#define IO_BUF_SIZE (524288 * 4)
 #define MAX_IOV_SIZE MIN_CONST(IOV_MAX, 64)
 
 struct QEMUFile {
@@ -776,6 +778,44 @@ static int qemu_compress_data(z_stream *stream, uint8_t *dest, size_t dest_len,
 
     return stream->next_out - dest;
 }
+
+#if defined(CONFIG_QATZIP)
+/*
+ * Compress size bytes of data start at p and store the compressed
+ * data to the buffer of f for intel qat.
+ *
+ * Since the file is dummy file with empty_ops, return -1 if f has no space to
+ * save the compressed data.
+ */
+inline __attribute__((always_inline))
+ssize_t qemu_put_compression_data_qat(QEMUFile *f,
+                                      QzSession_T *qzsess,
+                                      uint8_t *origin_buf,
+                                      uint32_t origins_sz,
+                                      uint8_t *compress_buf,
+                                      uint32_t compress_buf_sz)
+{
+    ssize_t blen = IO_BUF_SIZE - f->buf_index - sizeof(int64_t);
+
+    int rc =
+        qzCompress(qzsess, origin_buf, &origins_sz, compress_buf,
+                   &compress_buf_sz, 1);
+    if (unlikely(rc != QZ_OK)) {
+        error_report("%s ERROR: QAT Compression FAILED: %d!", __func__, rc);
+        return -1;
+    }
+    if (unlikely(blen < compress_buf_sz)) {
+        error_report("%s, ERROR:FAILED. IOBUfffer overflow, \
+        IObuffer size : %ld , compressed buf size: %d",\
+                     __func__, blen, compress_buf_sz);
+        return -1;
+    }
+    qemu_put_be64(f, compress_buf_sz);
+    /* memory copy to the IO buffer */
+    qemu_put_buffer(f, compress_buf, compress_buf_sz);
+    return compress_buf_sz + sizeof(int64_t);
+}
+#endif
 
 /* Compress size bytes of data start at p and store the compressed
  * data to the buffer of f.

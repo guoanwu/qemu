@@ -411,9 +411,15 @@ static void ram_transferred_add(uint64_t bytes)
 }
 
 /* define the max page number to compress together */
-#define MULTI_PAGE_NUM 64
+static uint64_t MULTI_PAGE_NUM ;
+#define MAX_MULTI_PAGE_NUM 64
 #define COMP_BUF_SIZE (TARGET_PAGE_SIZE *  MULTI_PAGE_NUM * 2)
 #define DECOMP_BUF_SIZE (TARGET_PAGE_SIZE * MULTI_PAGE_NUM)
+
+static void set_multi_page_num(uint64_t pgs)
+{
+    MULTI_PAGE_NUM = pgs;
+}
 
 typedef struct MultiPageAddr {
     /* real pages that will compress together */
@@ -421,7 +427,7 @@ typedef struct MultiPageAddr {
     /* the last index of the addr*/
     uint64_t last_idx;
     /* each address might contain contineous pages*/
-    uint64_t addr[MULTI_PAGE_NUM];
+    uint64_t addr[MAX_MULTI_PAGE_NUM];
 } MultiPageAddr;
 
 
@@ -3153,7 +3159,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
 {
     RAMState **rsp = opaque;
     RAMBlock *block;
-
+    set_multi_page_num(TARGET_PAGE_SIZE > 4096 ? 1 : 64);
     if (compress_threads_save_setup()) {
         return -1;
     }
@@ -3915,6 +3921,7 @@ void colo_release_ram_cache(void)
  */
 static int ram_load_setup(QEMUFile *f, void *opaque)
 {
+    set_multi_page_num(TARGET_PAGE_SIZE > 4096 ? 1 : 64);
     if (compress_threads_load_setup(f)) {
         return -1;
     }
@@ -4992,7 +4999,6 @@ do_compress_ram_page_multiple(QEMUFile *f, QzSession_T *qzsess,
         RAMBlock *block, MultiPageAddr *mpa)
 {
     uint64_t start, multi_pages, i;
-    int rc;
     uint32_t origin_size = 0, src_size = 0, dest_size = COMP_BUF_SIZE;
     ram_addr_t offset;
     uint8_t *base_addr;
@@ -5016,17 +5022,13 @@ do_compress_ram_page_multiple(QEMUFile *f, QzSession_T *qzsess,
         origbuf += origin_size;
         src_size += origin_size;
     }
-
-    rc = qzCompress(qzsess, decompbuf, &src_size, compbuf, &dest_size, 1);
-    if (rc != QZ_OK) {
-        error_report("ERROR: Compression FAILED: %d!", rc);
-        return false;
+    int ret =
+    qemu_put_compression_data_qat(f, qzsess, decompbuf, src_size,
+                                  compbuf, dest_size);
+    if (unlikely(ret < 0)) {
+        qemu_file_set_error(migrate_get_current()->to_dst_file, ret);
+        error_report("compressed data qat failed!");
     }
-
-    qemu_put_be64(f, dest_size);
-    /* memory copy to the IO buffer */
-    qemu_put_buffer(f, compbuf, dest_size);
-
     return true;
 }
 
