@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 
+
 #include "qemu/osdep.h"
 #include "qemu/madvise.h"
 #include "qemu/error-report.h"
@@ -32,8 +33,15 @@
 #include "qapi/error.h"
 
 
-/* with qat hw, the io buffer size need to expand */
-#define IO_BUF_SIZE (524288 * 4)
+/*
+ * with qat hw, the io buffer size need to expand
+ * need support for 2M hugepage, too big buffer
+ * size will degrade the performance. Additional
+ * 4k size to contain header information and
+ * pevent random page compress(the compressed
+ * size will bigger than origin size)
+ */
+#define IO_BUF_SIZE (2 * 1028 * 1024)
 #define MAX_IOV_SIZE MIN_CONST(IOV_MAX, 64)
 
 struct QEMUFile {
@@ -806,14 +814,29 @@ ssize_t qemu_put_compression_data_qat(QEMUFile *f,
     }
     if (unlikely(blen < compress_buf_sz)) {
         error_report("%s, ERROR:FAILED. IOBUfffer overflow, \
-        IObuffer size : %ld , compressed buf size: %d",\
-                     __func__, blen, compress_buf_sz);
+        IObuffer size : %ld , compressed buf size: %d ,origin buf size: %d",\
+                     __func__, blen, compress_buf_sz, origins_sz);
         return -1;
     }
     qemu_put_be64(f, compress_buf_sz);
     /* memory copy to the IO buffer */
     qemu_put_buffer(f, compress_buf, compress_buf_sz);
     return compress_buf_sz + sizeof(int64_t);
+}
+
+int64_t qemu_get_multi_page_num_for_qat(uint64_t max_multi_page_nums,
+                                   uint64_t target_page_size)
+{
+
+    if (IO_BUF_SIZE < target_page_size + 8) {
+        error_report("%s: IO_BUF_SIZE should great or equal\
+                     than TARGET_PAGE_SIZE (%d !>= %ld) in QAT.",
+                     __func__, IO_BUF_SIZE, target_page_size);
+        return -1;
+    }
+    uint64_t pgs = IO_BUF_SIZE / (target_page_size + 8);
+
+    return MIN(max_multi_page_nums, pgs);
 }
 #endif
 
@@ -914,3 +937,4 @@ QIOChannel *qemu_file_get_ioc(QEMUFile *file)
 {
     return file->has_ioc ? QIO_CHANNEL(file->opaque) : NULL;
 }
+

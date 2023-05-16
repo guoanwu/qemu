@@ -190,9 +190,12 @@ QIOChannel *qemu_file_get_ioc(QEMUFile *file);
 ssize_t qemu_put_compression_data_qat(QEMUFile *f,
                                       QzSession_T *qzsess,
                                       uint8_t *origin_buf,
-                                      uint32_t origins_sz,
+                                      uint32_t origins_buf_sz,
                                       uint8_t *compress_buf,
                                       uint32_t compress_buf_sz);
+
+int64_t qemu_get_multi_page_num_for_qat(uint64_t max_multi_page_nums,
+                                        uint64_t target_page_size);
 #endif
 
 #endif

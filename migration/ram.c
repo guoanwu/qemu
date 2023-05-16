@@ -411,15 +411,12 @@ static void ram_transferred_add(uint64_t bytes)
 }
 
 /* define the max page number to compress together */
-static uint64_t MULTI_PAGE_NUM ;
+static uint64_t MULTI_PAGE_NUM_FOR_QAT ;
 #define MAX_MULTI_PAGE_NUM 64
-#define COMP_BUF_SIZE (TARGET_PAGE_SIZE *  MULTI_PAGE_NUM * 2)
-#define DECOMP_BUF_SIZE (TARGET_PAGE_SIZE * MULTI_PAGE_NUM)
+#define COMP_BUF_SIZE (TARGET_PAGE_SIZE *  MULTI_PAGE_NUM_FOR_QAT * 2)
+#define DECOMP_BUF_SIZE (TARGET_PAGE_SIZE * MULTI_PAGE_NUM_FOR_QAT)
 
-static void set_multi_page_num(uint64_t pgs)
-{
-    MULTI_PAGE_NUM = pgs;
-}
+
 
 typedef struct MultiPageAddr {
     /* real pages that will compress together */
@@ -577,8 +574,11 @@ static size_t
 save_page_header_multiple(RAMBlock *block, QEMUFile *f,
                             MultiPageAddr *mpa);
 static inline void
-set_compress_params_multiple(CompressParam *param, RAMBlock *block,
-                        MultiPageAddr *pmpa);
+set_compress_params_multiple(CompressParam *param,
+                             RAMBlock *block,
+                             MultiPageAddr *pmpa,
+                             uint64_t addr_start,
+                             uint64_t addr_end);
 static bool
 save_compress_page_multiple(RAMState *rs, RAMBlock *block,
                         MultiPageAddr *mpa);
@@ -1634,55 +1634,123 @@ static inline void set_compress_params(CompressParam *param, RAMBlock *block,
     param->offset = offset;
 }
 
+#ifdef CONFIG_QATZIP
+static inline __attribute__((always_inline))
+int publish_task_to_qat_workers(RAMState *rs,
+                                RAMBlock *block,
+                                MultiPageAddr *mpa,
+                                ram_addr_t offset,
+                                bool wait,
+                                uint64_t thread_count)
+{
+    int  bytes_xmit = -1;
+    int64_t addr_end, multi_pages_xmit;
+    bool found = false;
+
+
+    for (uint64_t addr_start = 0; addr_start < mpa->last_idx ;
+        addr_start += MULTI_PAGE_NUM_FOR_QAT)
+    {
+        qemu_mutex_lock(&comp_done_lock);
+    retry:
+        for (int idx = 0; idx < thread_count; idx++) {
+            if (comp_param[idx].done) {
+                comp_param[idx].done = false;
+                bytes_xmit = qemu_put_qemu_file(rs->f, comp_param[idx].file);
+                multi_pages_xmit =  comp_param[idx].mpa.pages ;
+                qemu_mutex_lock(&comp_param[idx].mutex);
+                addr_end =
+                        MIN(addr_start + MULTI_PAGE_NUM_FOR_QAT, mpa->last_idx);
+                set_compress_params_multiple(&comp_param[idx],
+                                             block,
+                                             mpa,
+                                             addr_start,
+                                             addr_end);
+                found = true;
+                qemu_cond_signal(&comp_param[idx].cond);
+                qemu_mutex_unlock(&comp_param[idx].mutex);
+                update_compress_thread_counts(&comp_param[idx],
+                                              bytes_xmit, multi_pages_xmit);
+                break;
+            }
+        }
+
+        /*
+         * wait for the free thread if the user specifies
+         * 'compress-wait-thread', otherwise we will post
+         * the page out in the main thread as normal page.
+         */
+        if (!found && wait) {
+            qemu_cond_wait(&comp_done_cond, &comp_done_lock);
+            goto retry;
+        }
+
+        found = false;
+        qemu_mutex_unlock(&comp_done_lock);
+    }
+
+
+    return mpa->pages;
+}
+#endif
+
+static  inline __attribute__((always_inline))
+int publish_task_to_none_qat_workers(RAMState *rs,
+                                     RAMBlock *block,
+                                     ram_addr_t offset,
+                                     bool wait,
+                                     uint64_t thread_count)
+{
+    int  bytes_xmit = -1 ;
+    bool found = false;
+    qemu_mutex_lock(&comp_done_lock);
+    retry:
+        for (int idx = 0; idx < thread_count; idx++) {
+            if (comp_param[idx].done) {
+                comp_param[idx].done = false;
+                bytes_xmit = qemu_put_qemu_file(rs->f, comp_param[idx].file);
+                qemu_mutex_lock(&comp_param[idx].mutex);
+                set_compress_params(&comp_param[idx], block, offset);
+                found = true;
+                qemu_cond_signal(&comp_param[idx].cond);
+                qemu_mutex_unlock(&comp_param[idx].mutex);
+                update_compress_thread_counts(&comp_param[idx],
+                                              bytes_xmit, 1);
+                break;
+            }
+        }
+
+        /*
+         * wait for the free thread if the user specifies
+         * 'compress-wait-thread',otherwise we will post
+         * the page out in the main thread as normal page.
+         */
+        if (!found  && wait) {
+            qemu_cond_wait(&comp_done_cond, &comp_done_lock);
+            goto retry;
+        }
+        qemu_mutex_unlock(&comp_done_lock);
+        return 1;
+}
+
 static int compress_page_with_multi_thread(RAMState *rs, RAMBlock *block,
                                     MultiPageAddr *mpa, ram_addr_t offset)
 {
-    int idx, thread_count, bytes_xmit = -1, pages = -1;
     bool wait = migrate_compress_wait_thread();
 
-    thread_count = migrate_compress_threads();
-    qemu_mutex_lock(&comp_done_lock);
-retry:
-    for (idx = 0; idx < thread_count; idx++) {
-        if (comp_param[idx].done) {
-            comp_param[idx].done = false;
-            bytes_xmit = qemu_put_qemu_file(rs->f, comp_param[idx].file);
-            int multi_pages = 1;
-            #ifdef CONFIG_QATZIP
-            bool qat_enable = migrate_compress_with_qat();
-            multi_pages = (qat_enable ? comp_param[idx].mpa.pages : 1);
-            #endif
-            qemu_mutex_lock(&comp_param[idx].mutex);
-#ifdef CONFIG_QATZIP
-            if (qat_enable) {
-                set_compress_params_multiple(&comp_param[idx], block, mpa);
-                pages = mpa->pages;
-            } else {
-#endif
-                set_compress_params(&comp_param[idx], block, offset);
-                pages = 1;
-#ifdef CONFIG_QATZIP
-            }
-#endif
-            qemu_cond_signal(&comp_param[idx].cond);
-            qemu_mutex_unlock(&comp_param[idx].mutex);
-            update_compress_thread_counts(&comp_param[idx],
-                        bytes_xmit, multi_pages);
-            break;
-        }
+    int thread_count = migrate_compress_threads();
+    #ifdef CONFIG_QATZIP
+    bool qat_enable = migrate_compress_with_qat();
+    if (qat_enable) {
+        return  publish_task_to_qat_workers(rs, block, mpa,
+                                            offset, wait, thread_count);
     }
+    return  publish_task_to_none_qat_workers(rs, block, offset,
+                                             wait, thread_count);
+    #endif
 
-    /*
-     * wait for the free thread if the user specifies 'compress-wait-thread',
-     * otherwise we will post the page out in the main thread as normal page.
-     */
-    if (pages < 0 && wait) {
-        qemu_cond_wait(&comp_done_cond, &comp_done_lock);
-        goto retry;
-    }
-    qemu_mutex_unlock(&comp_done_lock);
-
-    return pages;
+    return  publish_task_to_none_qat_workers(rs, block, offset,
+                                             wait, thread_count);
 }
 
 /**
@@ -3159,7 +3227,17 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
 {
     RAMState **rsp = opaque;
     RAMBlock *block;
-    set_multi_page_num(TARGET_PAGE_SIZE > 4096 ? 1 : 64);
+
+#if defined(CONFIG_QATZIP)
+    if (migrate_compress_with_qat()) {
+        MULTI_PAGE_NUM_FOR_QAT =
+            qemu_get_multi_page_num_for_qat(MAX_MULTI_PAGE_NUM,
+                                            TARGET_PAGE_SIZE);
+        if (MULTI_PAGE_NUM_FOR_QAT == -1) {
+            return -1;
+        }
+    }
+#endif
     if (compress_threads_save_setup()) {
         return -1;
     }
@@ -3921,7 +3999,18 @@ void colo_release_ram_cache(void)
  */
 static int ram_load_setup(QEMUFile *f, void *opaque)
 {
-    set_multi_page_num(TARGET_PAGE_SIZE > 4096 ? 1 : 64);
+
+#if defined(CONFIG_QATZIP)
+    if (migrate_compress_with_qat()) {
+        MULTI_PAGE_NUM_FOR_QAT =
+            qemu_get_multi_page_num_for_qat(MAX_MULTI_PAGE_NUM,
+                                            TARGET_PAGE_SIZE);
+        if (MULTI_PAGE_NUM_FOR_QAT == -1) {
+            return -1;
+        }
+    }
+#endif
+
     if (compress_threads_load_setup(f)) {
         return -1;
     }
@@ -4727,7 +4816,7 @@ migration_bitmap_find_dirty_multiple_normal(RAMState *rs,
         return size;
     }
     /* from the start pos to search the dirty bitmap*/
-    while ((mpa->pages < MULTI_PAGE_NUM)) {
+    while ((mpa->pages < MAX_MULTI_PAGE_NUM)) {
         start = find_next_bit(bitmap, size, start);
         /* if start>= size mean can't find any more*/
         if (start >= size) {
@@ -4743,10 +4832,10 @@ migration_bitmap_find_dirty_multiple_normal(RAMState *rs,
         /*
          * if total pages over MULTI_PAGE_NUM
          * keep last mpa entry pages is:
-         * MULTI_PAGE_NUM - mpa->pages
+         * MAX_MULTI_PAGE_NUM - mpa->pages
          */
-        if ((mpa->pages + pages) > MULTI_PAGE_NUM) {
-            pages = MULTI_PAGE_NUM - mpa->pages;
+        if ((mpa->pages + pages) > MAX_MULTI_PAGE_NUM) {
+            pages = MAX_MULTI_PAGE_NUM - mpa->pages;
         }
         multi_page_addr_put_one(mpa, start, pages);
         start += pages;
@@ -4844,7 +4933,7 @@ migration_bitmap_find_dirty_multiple_avx512(RAMState *rs,
          * complicated calculate next start index
          */
 
-        if (mpa->pages + sz > MULTI_PAGE_NUM) {
+        if (mpa->pages + sz > MAX_MULTI_PAGE_NUM) {
             break;
         }
 
@@ -4914,10 +5003,14 @@ save_page_header_multiple(RAMBlock *block, QEMUFile *f,
 /* save compress paramters for mpa*/
 static inline void
 set_compress_params_multiple(CompressParam *param, RAMBlock *block,
-                            MultiPageAddr *pmpa)
+                             MultiPageAddr *pmpa, uint64_t addr_start,
+                             uint64_t addr_end)
 {
     param->block = block;
-    memcpy(&param->mpa, pmpa, sizeof(MultiPageAddr));
+    param->mpa.pages = addr_end - addr_start;
+    param->mpa.last_idx = param->mpa.pages;
+    memcpy(param->mpa.addr, pmpa->addr + addr_start,
+           (addr_end - addr_start) * sizeof(uint64_t));
 }
 
 /*
